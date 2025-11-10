@@ -72,7 +72,7 @@ pip install black ruff
 
 ### 3. Create .env (example below)
 
-Create a file named .env (never commit it):
+Create a file named .env:
 ```bash
 CSFLOAT_API_KEY=your_api_key_here
 DEFAULT_ITEM=AK-47 | Redline (Field-Tested)
