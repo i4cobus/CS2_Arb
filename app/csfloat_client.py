@@ -1,84 +1,197 @@
+# app/csfloat_client.py
+from __future__ import annotations
+
 import time
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Iterator, Tuple
+
 import httpx
-from typing import Iterator, Dict, Any, Optional, List, Tuple
-from .models import Listing
+
 from .config import CFG, require_config
+from .wear import wear_bucket_range
+from .market_name import build_market_hash_name
 from .history import compute_sales_24h_metrics
 
 API_BASE = "https://csfloat.com/api/v1"
 
-class CSFloatError(RuntimeError): ...
+# ---------------------------------------------
+# Models
+# ---------------------------------------------
 
-def _headers() -> dict[str, str]:
+@dataclass
+class Listing:
+    id: Optional[str]
+    market_hash_name: str
+    price_usd: float
+    float_value: Optional[float] = None
+    state: Optional[str] = None
+    paint_seed: Optional[int] = None
+
+
+# ---------------------------------------------
+# Helpers
+# ---------------------------------------------
+
+def _headers() -> Dict[str, str]:
     require_config()
-    key = CFG["CSFLOAT_API_KEY"]
-    return {"Authorization": key}  # raw key; no "Bearer"
+    return {"Authorization": CFG["CSFLOAT_API_KEY"]}
+
+def _as_int(x, default=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+def _as_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _price_cents_from_row(row: dict) -> int:
+    """
+    Most CSFloat listing payloads have 'price' in cents at root.
+    Be defensive with alternates.
+    """
+    for key in ("price", "usd_price_cents", "price_cents", "listed_price"):
+        if key in row and isinstance(row[key], (int, float, str)):
+            return _as_int(row[key], 0)
+    return 0
+
+_NON_FLOAT_KEYWORDS = {
+    "music kit", "sticker", "patch", "agent", "graffiti",
+    "case", "collectible", "pin", "key", "viewer pass", "souvenir package",
+    "charm", "gift"
+}
+
+def _item_supports_float(name: str) -> bool:
+    low = (name or "").lower()
+    return not any(k in low for k in _NON_FLOAT_KEYWORDS)
 
 def _extract_rows(payload) -> list[dict]:
-    # raw list
+    # API can return a list or a dict holding a list
     if isinstance(payload, list):
         return payload
-    # common dict shapes
     if isinstance(payload, dict):
-        for k in ("listings", "results", "data", "items"):
+        for k in ("listings", "results", "data", "items", "rows"):
             v = payload.get(k)
             if isinstance(v, list):
                 return v
     return []
 
+# ---------------------------------------------
+# Listings
+# ---------------------------------------------
+
 def iter_listings(
     market_hash_name: Optional[str] = None,
-    sort_by: str = "lowest_price",
-    limit: int = 50,
+    sort_by: str = "lowest_price",          # "lowest_price" | "highest_price" | "best_deal" | "most_recent"
+    limit: int = 50,                         # API caps at 50
     extra_params: Optional[Dict[str, Any]] = None,
     max_pages: int = 5,
     backoff_s: float = 1.5,
     debug: bool = False,
 ) -> Iterator[dict]:
-    params: Dict[str, Any] = {"limit": min(limit, 50), "sort_by": sort_by}
+    """
+    Streams paginated listings with robust parsing & optional debug logs.
+    Yields raw listing dicts as returned by the API.
+    """
+    base_params: Dict[str, Any] = {
+        "limit": min(int(limit or 50), 50),
+        "sort_by": sort_by or "lowest_price",
+    }
     if market_hash_name:
-        params["market_hash_name"] = market_hash_name
+        base_params["market_hash_name"] = market_hash_name
+
     if extra_params:
-        params.update(extra_params)
+        for k, v in extra_params.items():
+            if v is None:
+                continue
+            if isinstance(v, str) and v.strip() == "":
+                continue
+            if isinstance(v, (list, tuple)) and len(v) == 0:
+                continue
+            base_params[k] = v
 
     cursor = None
     pages = 0
+
     with httpx.Client(timeout=20) as client:
         while True:
+            request_params = dict(base_params)
             if cursor:
-                params["cursor"] = cursor
+                request_params["cursor"] = cursor
+
             if debug:
-                print("GET /listings", {"params": {k: v for k, v in params.items() if k != "cursor"}})
-            r = client.get(f"{API_BASE}/listings", headers=_headers(), params=params)
+                print("➡️  GET /listings", request_params)
+
+            r = client.get(f"{API_BASE}/listings", headers=_headers(), params=request_params)
+
             if debug:
-                print("Status:", r.status_code, "X-Next-Cursor:", r.headers.get("X-Next-Cursor"))
+                print("⬅️  Status:", r.status_code, "X-Next-Cursor:", r.headers.get("X-Next-Cursor"))
+
             if r.status_code == 429:
+                if debug:
+                    print(f"⚠️  429 rate limited → sleeping {backoff_s}s…")
                 time.sleep(backoff_s)
                 continue
+
+            if 500 <= r.status_code < 600:
+                if debug:
+                    print(f"⚠️  {r.status_code} server error → sleeping {backoff_s}s and retrying once…")
+                time.sleep(backoff_s)
+                r = client.get(f"{API_BASE}/listings", headers=_headers(), params=request_params)
+
             r.raise_for_status()
-            payload = r.json()
+
+            try:
+                payload = r.json()
+            except Exception as e:
+                if debug:
+                    print("❌ JSON parse error:", e, "| text[:400]=", r.text[:400])
+                return
+
             rows = _extract_rows(payload)
-            if debug and not rows:
-                print("No rows in this page. Raw keys:", list(payload.keys()) if isinstance(payload, dict) else "list/empty")
+            if debug:
+                shape = type(payload).__name__
+                print(f"🧩 Payload shape={shape} | rows_found={len(rows)}")
+                if not rows and isinstance(payload, dict):
+                    print("   Available keys:", list(payload.keys()))
+
             if not rows:
                 return
+
             for row in rows:
                 yield row
+
             cursor = r.headers.get("X-Next-Cursor") or None
             pages += 1
+
+            if debug:
+                print("📄 Page", pages, "| next_cursor:", cursor)
+
             if not cursor or pages >= max_pages:
                 return
 
 def map_listing(row: dict) -> Listing:
-    item = row.get("item", {})
-    price_cents = row.get("price", 0)
+    item = row.get("item", {}) or {}
+    price_cents = _price_cents_from_row(row)
+
+    fv = row.get("float_value")
+    if fv is None:
+        fv = item.get("float_value")
+
+    paint_seed = row.get("paint_seed")
+    if paint_seed is None:
+        paint_seed = item.get("paint_seed")
+
     return Listing(
         id=str(row.get("id")) if row.get("id") is not None else None,
-        market_hash_name=item.get("market_hash_name", ""),
-        price_usd=float(price_cents) / 100.0,
-        float_value=row.get("float_value"),
-        state=row.get("state"),
-        paint_seed=row.get("paint_seed"),
+        market_hash_name=item.get("market_hash_name", "") or row.get("market_hash_name", ""),
+        price_usd=_as_float(price_cents, 0) / 100.0,
+        float_value=_as_float(fv, None) if fv is not None else None,
+        state=row.get("state") or item.get("state"),
+        paint_seed=_as_int(paint_seed, None) if paint_seed is not None else None,
     )
 
 def _first_listing(
@@ -91,17 +204,23 @@ def _first_listing(
     if category is not None:
         params["category"] = category              # 1 normal, 2 stattrak, 3 souvenir
     if wear_bucket:
-        params["min_float"], params["max_float"] = wear_bucket
+        lo, hi = wear_bucket
+        if lo is not None and hi is not None:
+            params["min_float"], params["max_float"] = lo, hi
 
     for row in iter_listings(
         market_hash_name=name,
         sort_by=sort_by,
         limit=50,
-        extra_params=params,
+        extra_params=params if params else None,
         max_pages=1,
     ):
         return map_listing(row)
     return None
+
+# ---------------------------------------------
+# Buy orders
+# ---------------------------------------------
 
 def fetch_buy_orders_for_listing(listing_id: str, limit: int = 10) -> list[dict]:
     r = httpx.get(
@@ -120,13 +239,81 @@ def highest_bid_from_orders(orders: list[dict]) -> Tuple[float, int] | None:
     """
     if not orders:
         return None
-    # Filter to orders that actually have numeric price
-    clean = [o for o in orders if isinstance(o.get("price"), (int, float))]
+    clean = [o for o in orders if isinstance(o.get("price"), (int, float, str))]
     if not clean:
         return None
-    top_cents = max(int(o["price"]) for o in clean)
-    qty_top = sum(int(o.get("qty", 0)) for o in clean if int(o["price"]) == top_cents)
+    cents = [_as_int(o.get("price")) for o in clean]
+    top_cents = max(cents)
+    qty_top = sum(_as_int(o.get("qty", 0)) for o in clean if _as_int(o.get("price")) == top_cents)
     return (top_cents / 100.0, qty_top)
+
+# ---------------------------------------------
+# Snapshots
+# ---------------------------------------------
+
+# Back-compat category mapping (int for API)
+_CATEGORY_MAP = {"normal": 1, "stattrak": 2, "souvenir": 3}
+
+def fetch_snapshot_by_params(
+    base_name: str,
+    wear_key: Optional[str] = None,              # "fn","mw","ft","ww","bs" or None
+    category_key: Optional[str] = None,          # "normal","stattrak","souvenir" or None
+    debug: bool = False,
+) -> dict:
+    """
+    Build canonical name from friendly inputs and fetch a snapshot.
+    If the first attempt yields no listing for non-floatables (e.g., Music Kits),
+    we auto-try the alternate name variant (normal <-> stattrak) with relaxed category.
+    """
+    # 1) Primary attempt
+    name_primary = build_market_hash_name(base_name, wear_key, category_key)
+    cat_primary = _CATEGORY_MAP.get(category_key) if category_key else None
+    wear_bucket = wear_bucket_range(wear_key) if (wear_key and _item_supports_float(name_primary)) else None
+
+    snap = fetch_snapshot_metrics(
+        name=name_primary,
+        category=cat_primary,
+        wear_bucket=wear_bucket,
+        debug=debug,
+    )
+
+    # If we found something, return immediately
+    if snap.get("lowest_ask", 0.0) > 0.0 or snap.get("vol24h", 0) > 0:
+        return snap
+
+    # 2) Alternate attempt (handles Music Kit / Sticker etc. name mismatch)
+    # Only makes sense when switching stattrak <-> normal (souvenir not applicable to music kits/etc.)
+    alt_category_key = None
+    if category_key == "stattrak":
+        alt_category_key = "normal"
+    elif category_key == "normal":
+        alt_category_key = "stattrak"
+
+    # If there is a viable alternate
+    if alt_category_key:
+        name_alt = build_market_hash_name(base_name, wear_key, alt_category_key)
+        # For the alternate attempt, relax category to None (most permissive)
+        cat_alt = None
+        wear_bucket_alt = wear_bucket if _item_supports_float(name_alt) else None
+
+        if debug:
+            print(f"⚙️  Primary name had no results. Trying alt name: {name_alt} (category=None)")
+
+        snap_alt = fetch_snapshot_metrics(
+            name=name_alt,
+            category=cat_alt,
+            wear_bucket=wear_bucket_alt,
+            debug=debug,
+        )
+
+        # If alt found results, annotate and return
+        if snap_alt.get("lowest_ask", 0.0) > 0.0 or snap_alt.get("vol24h", 0) > 0:
+            # Optional: surface which name matched (useful for logs)
+            snap_alt["used_name_variant"] = name_alt
+            return snap_alt
+
+    # Nothing found—return the primary (empty) result
+    return snap
 
 def fetch_snapshot_metrics(
     name: str,
@@ -135,43 +322,71 @@ def fetch_snapshot_metrics(
     debug: bool = False,
 ) -> dict:
     """
-    Snapshot for one item:
-      - lowest ask (by filters)
+    Snapshot for one item (already-built market_hash_name):
+      - lowest ask (by filters, with fallbacks)
       - highest bid (+ qty) via /listings/{id}/buy-orders
       - vol24h & asp24h via /history/<name>/sales (filtered client-side)
     """
+    # If item family doesn't support floats, never pass wear filters
+    supports_float = _item_supports_float(name)
+    requested_wear = wear_bucket
+    if not supports_float:
+        wear_bucket = None
+
     def try_first(sort_by: str, cat: int | None, wb: tuple[float, float] | None, label: str):
         lst = _first_listing(name, sort_by, cat, wb)
-        return lst, label
+        return lst, label, cat, wb
 
-    # Lowest ask with fallback cascade
-    lowest, source = try_first("lowest_price", category, wear_bucket, "strict(name+cat+wear)")
-    used_cat, used_wear = category, wear_bucket
+    lowest = None
+    source = "n/a"
+    used_cat = None
+    used_wear = None
 
-    if lowest is None and wear_bucket is not None:
-        lowest, source = try_first("lowest_price", category, None, "no_wear(name+cat)")
-        if lowest:
-            used_wear = None
+    # 1) strict: name + cat + wear
+    l, s, c_used, w_used = try_first("lowest_price", category, wear_bucket, "strict(name+cat+wear)")
+    if l:
+        lowest, source, used_cat, used_wear = l, s, c_used, w_used
 
-    if lowest is None and category is not None:
-        lowest, source = try_first("lowest_price", None, wear_bucket, "no_cat(name+wear)")
-        if lowest:
-            used_cat = None
+    # 2) relax wear
+    if not lowest and wear_bucket is not None:
+        l, s, c_used, w_used = try_first("lowest_price", category, None, "no_wear(name+cat)")
+        if l:
+            lowest, source, used_cat, used_wear = l, s, c_used, w_used
 
-    if lowest is None:
-        lowest, source = try_first("lowest_price", None, None, "name_only")
+    # 3) relax category
+    if not lowest and category is not None:
+        l, s, c_used, w_used = try_first("lowest_price", None, requested_wear if supports_float else None, "no_cat(name+wear)")
+        if l:
+            lowest, source, used_cat, used_wear = l, s, c_used, w_used
 
-    # Highest bid from lowest listing id
+    # 4) name only
+    if not lowest:
+        l, s, c_used, w_used = try_first("lowest_price", None, None, "name_only")
+        if l:
+            lowest, source, used_cat, used_wear = l, s, c_used, w_used
+
+    # Highest bid
     highest_bid = None
     highest_bid_qty = None
     if lowest and lowest.id:
-        orders = fetch_buy_orders_for_listing(lowest.id, limit=10)
-        hb = highest_bid_from_orders(orders)
-        if hb:
-            highest_bid, highest_bid_qty = hb
+        try:
+            orders = fetch_buy_orders_for_listing(lowest.id, limit=10)
+            hb = highest_bid_from_orders(orders)
+            if hb:
+                highest_bid, highest_bid_qty = hb
+        except Exception:
+            pass
 
-    # Sales 24h (filtered by original requested filters, not the relaxed ones)
-    vol24h, asp24h = compute_sales_24h_metrics(name, wear_bucket, category, lookback_hours=24, limit=400)
+    # Sales 24h (history): keep user's category intent; apply wear only if floatable
+    history_wear = requested_wear if supports_float else None
+    history_cat = category
+
+    try:
+        vol24h, asp24h = compute_sales_24h_metrics(
+            name, history_wear, history_cat, lookback_hours=24, limit=400, debug=debug
+        )
+    except Exception:
+        vol24h, asp24h = 0, 0.0
 
     return {
         "source": source,
@@ -183,31 +398,5 @@ def fetch_snapshot_metrics(
         "asp24h": asp24h,
         "used_category": used_cat,
         "used_wear": used_wear,
+        "is_floatable": supports_float,
     }
-
-# Extra utilities kept for future features (top-N, base price, etc.)
-def fetch_top_n_for_item(
-    name: str,
-    n: int = 10,
-    sort_by: str = "lowest_price",
-    category: int | None = None,
-    wear_bucket: tuple[float, float] | None = None,
-) -> list[Listing]:
-    params: Dict[str, Any] = {}
-    if category is not None:
-        params["category"] = category
-    if wear_bucket:
-        params["min_float"], params["max_float"] = wear_bucket
-
-    listings: list[Listing] = []
-    for row in iter_listings(
-        market_hash_name=name,
-        sort_by=sort_by,
-        limit=50,
-        extra_params=params,
-        max_pages=5,
-    ):
-        listings.append(map_listing(row))
-        if len(listings) >= n:
-            break
-    return listings

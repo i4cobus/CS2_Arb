@@ -35,7 +35,6 @@ CS2_Arb/
 │  ├─ csfloat_client.py
 │  ├─ history.py
 │  ├─ wear.py
-│  ├─ pricing.py
 │  ├─ logger.py
 │  ├─ main.py
 │  ├─ quick_probe.py
