@@ -4,7 +4,7 @@ This project is a Python data application that collects marketplace data, normal
 
 The domain is CS2 marketplace pricing, but the engineering focus is broader: API ingestion, data cleaning, feature engineering, recommendation ranking, SQL analytics, data quality checks, and LLM-style question answering over structured data.
 
-## Recruiter Summary
+## Summary
 
 - Built an end-to-end Python data pipeline that ingests data from CSFloat and YouPin APIs.
 - Normalized cross-market item names using Steam `market_hash_name` conventions.
@@ -30,20 +30,6 @@ data/watchlist.csv
   -> SQL analytics
   -> LLM-ready natural-language analyst
 ```
-
-## Skills Demonstrated
-
-- Python programming
-- API integration
-- Data pipeline engineering
-- CSV dataset construction
-- Feature engineering
-- Recommendation and ranking logic
-- SQL analytics
-- Data quality governance
-- Unit testing
-- Git-oriented project organization
-- LLM-ready retrieval and analysis workflow
 
 ## Project Structure
 
